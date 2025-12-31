@@ -31,6 +31,10 @@ USO:
     python generar_secuencias.py --year 2026 --host localhost --port 5434
     python generar_secuencias.py --year 2026 --host databaseodoo --port 5432
 
+    # Modo prueba (dry-run) - analiza sin ejecutar
+    python generar_secuencias.py --year 2026 --dry-run
+    python generar_secuencias.py --year 2026 --database AMBIENTE2 --dry-run
+
     # Ver ayuda
     python generar_secuencias.py --help
 """
@@ -119,13 +123,14 @@ SECUENCIAS_CONFIG = [
 # =============================================================================
 
 class GeneradorSecuencias:
-    def __init__(self, year=None, database=None, exclude=None, host=None, port=None):
+    def __init__(self, year=None, database=None, exclude=None, host=None, port=None, dry_run=False):
         self.year = year
         self.database = database
         self.exclude = exclude.split(',') if exclude else []
         self.resultados = {}
         self.fecha_inicio = f'{year}-01-01' if year else None
         self.fecha_fin = f'{year}-12-31' if year else None
+        self.dry_run = dry_run
 
         # Configuracion de conexion (prioridad: parametro > env > default)
         self.pg_host = host or DEFAULT_PG_HOST
@@ -611,32 +616,38 @@ class GeneradorSecuencias:
                             resultado['errores'].append(f"{nombre_seq}: {detalle}")
                         resultado['secuencias_existentes'] += 1
                     else:
-                        # Crear la secuencia
-                        datos = {
-                            'nit': nit,
-                            'validity_start': self.fecha_inicio,
-                            'validity_end': self.fecha_fin,
-                            'sequence_name': nombre_seq,
-                            'initial_number': 1,
-                            'maximum_number': 999999999,
-                            'tipo_documento_id': tipo_doc_id,
-                            'store_id': caja['store_id'],
-                            'cash_register_id': caja['cash_register_id'],
-                        }
-
-                        res = self.crear_secuencia(conn, datos)
-
-                        if res['exito']:
-                            sec_resultado['estado'] = 'OK'
-                            resultado['secuencias_creadas'] += 1
+                        # Modo dry-run: solo marcar como pendiente
+                        if self.dry_run:
+                            sec_resultado['estado'] = 'PENDIENTE'
+                            sec_resultado['detalle'] = 'Se creara'
+                            resultado['secuencias_creadas'] += 1  # Contamos como "a crear"
                         else:
-                            sec_resultado['estado'] = 'ERROR'
-                            sec_resultado['detalle'] = res['error']
-                            resultado['secuencias_con_error_creacion'] += 1
-                            resultado['observaciones_error_creacion'].append(
-                                f"{nombre_seq}: {res['error']}"
-                            )
-                            resultado['errores'].append(f"{nombre_seq}: {res['error']}")
+                            # Crear la secuencia
+                            datos = {
+                                'nit': nit,
+                                'validity_start': self.fecha_inicio,
+                                'validity_end': self.fecha_fin,
+                                'sequence_name': nombre_seq,
+                                'initial_number': 1,
+                                'maximum_number': 999999999,
+                                'tipo_documento_id': tipo_doc_id,
+                                'store_id': caja['store_id'],
+                                'cash_register_id': caja['cash_register_id'],
+                            }
+
+                            res = self.crear_secuencia(conn, datos)
+
+                            if res['exito']:
+                                sec_resultado['estado'] = 'OK'
+                                resultado['secuencias_creadas'] += 1
+                            else:
+                                sec_resultado['estado'] = 'ERROR'
+                                sec_resultado['detalle'] = res['error']
+                                resultado['secuencias_con_error_creacion'] += 1
+                                resultado['observaciones_error_creacion'].append(
+                                    f"{nombre_seq}: {res['error']}"
+                                )
+                                resultado['errores'].append(f"{nombre_seq}: {res['error']}")
 
                     resultado['total_secuencias'] += 1
                     caja_resultado['secuencias'].append(sec_resultado)
@@ -659,7 +670,11 @@ class GeneradorSecuencias:
 
         log = []
         log.append(linea)
-        log.append("                    REPORTE DE CREACION DE SECUENCIAS")
+        if self.dry_run:
+            log.append("                    INFORME DE ANALISIS (DRY-RUN)")
+            log.append("                    *** NO SE REALIZARON CAMBIOS ***")
+        else:
+            log.append("                    REPORTE DE CREACION DE SECUENCIAS")
         log.append(f"                    Año: {self.year} | Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log.append(linea)
         log.append("")
@@ -731,7 +746,10 @@ class GeneradorSecuencias:
             total_secuencias += resultado['secuencias_creadas']
             sec_omitidas = resultado.get('secuencias_omitidas', 0)
             sec_error_creacion = resultado.get('secuencias_con_error_creacion', 0)
-            log.append(f"  TOTAL BASE: {resultado['secuencias_creadas']} creadas | {resultado['secuencias_validadas_ok']} validadas | {sec_omitidas} omitidas | {resultado['secuencias_con_error_config'] + sec_error_creacion} errores")
+            if self.dry_run:
+                log.append(f"  TOTAL BASE: {resultado['secuencias_creadas']} a crear | {resultado['secuencias_validadas_ok']} ya existen OK | {sec_omitidas} omitidas | {resultado['secuencias_con_error_config']} con error config")
+            else:
+                log.append(f"  TOTAL BASE: {resultado['secuencias_creadas']} creadas | {resultado['secuencias_validadas_ok']} validadas | {sec_omitidas} omitidas | {resultado['secuencias_con_error_config'] + sec_error_creacion} errores")
             log.append(f"  ESTADO: {resultado['estado']}")
 
             if resultado['errores']:
@@ -765,10 +783,16 @@ class GeneradorSecuencias:
         log.append(f"  Bases omitidas:         {total_omitidas}")
         log.append(f"  Bases con error:        {total_errores}")
         log.append("")
-        log.append(f"  Secuencias creadas:     {total_secuencias}")
-        log.append(f"  Secuencias validadas:   {total_validadas_ok} (ya existian, config correcta)")
-        log.append(f"  Secuencias omitidas:    {total_sec_omitidas} (tipo documento no existe)")
-        log.append(f"  Secuencias con error:   {total_error_config + total_error_creacion} (config incorrecta o fallo creacion)")
+        if self.dry_run:
+            log.append(f"  Secuencias A CREAR:     {total_secuencias}")
+            log.append(f"  Secuencias existentes:  {total_validadas_ok} (ya existen, config correcta)")
+            log.append(f"  Secuencias omitidas:    {total_sec_omitidas} (tipo documento no existe)")
+            log.append(f"  Secuencias con error:   {total_error_config} (config incorrecta)")
+        else:
+            log.append(f"  Secuencias creadas:     {total_secuencias}")
+            log.append(f"  Secuencias validadas:   {total_validadas_ok} (ya existian, config correcta)")
+            log.append(f"  Secuencias omitidas:    {total_sec_omitidas} (tipo documento no existe)")
+            log.append(f"  Secuencias con error:   {total_error_config + total_error_creacion} (config incorrecta o fallo creacion)")
         log.append("")
 
         # Mostrar observaciones de omitidas (sin duplicados)
@@ -828,7 +852,11 @@ class GeneradorSecuencias:
         """Ejecuta el proceso principal"""
         print("")
         print("=" * 80)
-        print("          GENERADOR DE SECUENCIAS DE DOCUMENTOS FISCALES")
+        if self.dry_run:
+            print("          ANALISIS DE SECUENCIAS (DRY-RUN)")
+            print("          *** MODO SIMULACION - NO SE CREARA NADA ***")
+        else:
+            print("          GENERADOR DE SECUENCIAS DE DOCUMENTOS FISCALES")
         print(f"          Año: {self.year}")
         print(f"          Conexion: {self.pg_host}:{self.pg_port}")
         print("=" * 80)
@@ -984,6 +1012,12 @@ Puertos tipicos:
         help='Escanear puertos y mostrar conexiones disponibles'
     )
 
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Modo simulacion: analiza sin crear secuencias'
+    )
+
     args = parser.parse_args()
 
     # Modo diagnostico - escanea puertos
@@ -1018,7 +1052,8 @@ Puertos tipicos:
         database=args.database,
         exclude=args.exclude,
         host=args.host,
-        port=args.port
+        port=args.port,
+        dry_run=args.dry_run
     )
 
     try:
