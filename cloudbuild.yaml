@@ -1,0 +1,53 @@
+# =============================================================================
+# Despliegue de este addon a la plataforma Odoo (GKE, factura-ia-prod).
+# Mueve el pin del submódulo en grupo-consiti/odoo-plataforma al commit recién
+# pusheado y hace push; ese push dispara `odoo-deploy` (bucket de addons →
+# rollout de Odoo → `odoo -u <módulo>` en todas las bases).
+#
+# El MISMO archivo vive en todos los addons con pipeline; lo único que cambia es
+# la substitution _ADDON_PATH que fija el trigger (infra-tf-odoo-cbii/triggers.tf,
+# módulo trigger_odoo_addons). Rama que despliega = la del trigger: `17.0` en los
+# addons con rama por versión de Odoo (odoo-felsv-17, felsv_carga_facturas),
+# `main` en el resto. En dev/test el archivo existe por coherencia pero no hay
+# trigger, así que no despliega nada.
+# Idempotente: si el pin ya apunta a este commit, termina sin cambios.
+# =============================================================================
+steps:
+  - id: bump-pin
+    name: gcr.io/cloud-builders/git
+    entrypoint: bash
+    secretEnv: ['GITHUB_TOKEN']
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        ADDON_PATH='${_ADDON_PATH}'; NAME=$$(basename "$$ADDON_PATH")
+        git clone -q --depth 1 --branch '${_PLATFORM_BRANCH}' \
+          "https://x-access-token:$${GITHUB_TOKEN}@github.com/grupo-consiti/odoo-plataforma.git" plataforma
+        cd plataforma
+        git config user.name  'cloudbuild addon ${REPO_NAME}'
+        git config user.email 'cloudbuild@consiti.com'
+        [ -e "$$ADDON_PATH" ] || { echo "ERROR: $$ADDON_PATH no es un submódulo de odoo-plataforma"; exit 1; }
+        # gitlink del submódulo → commit disparador (sin clonar el addon)
+        git update-index --cacheinfo "160000,${COMMIT_SHA},$$ADDON_PATH"
+        # addons.lock: referencia humana (addon rama commit remoto)
+        sed -i -E "s#^($$NAME) [^ ]+ [0-9a-f]+ #\1 ${BRANCH_NAME} ${COMMIT_SHA} #" addons.lock
+        git add addons.lock
+        if git diff --cached --quiet; then echo "sin cambios: el pin de $$NAME ya apunta a ${SHORT_SHA}"; exit 0; fi
+        git commit -q -m "bump $$NAME → ${SHORT_SHA} (${BRANCH_NAME})"
+        # Reintento por si otro addon empujó a la vez (push no fast-forward)
+        for i in 1 2 3; do
+          git push -q origin HEAD:'${_PLATFORM_BRANCH}' && { echo "pin de $$NAME → ${SHORT_SHA}: odoo-deploy en camino"; exit 0; }
+          git pull -q --rebase origin '${_PLATFORM_BRANCH}'
+        done
+        echo "ERROR: no se pudo empujar el bump tras 3 intentos"; exit 1
+availableSecrets:
+  secretManager:
+    - versionName: projects/consiti-foundation/secrets/GITHUB_CONSITI_PAT/versions/latest
+      env: GITHUB_TOKEN
+substitutions:
+  _ADDON_PATH: addons/${REPO_NAME} # el trigger lo fija; default = repo con el mismo nombre que la carpeta
+  _PLATFORM_BRANCH: main
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
